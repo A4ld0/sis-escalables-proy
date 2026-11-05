@@ -1,0 +1,45 @@
+{
+  "name": "chat-aws",
+  "private": true,
+  "scripts": {
+    "build": "ng build",
+    "check": "tsc -p tsconfig.server.json --noEmit",
+    "synth": "cdk synth",
+    "start": "ng serve",
+    "test": "tsx --test server/data.test.ts"
+  },
+  "dependencies": {
+    "@angular/common": "~21.2.0",
+    "@angular/compiler": "~21.2.0",
+    "@angular/core": "~21.2.0",
+    "@angular/forms": "~21.2.0",
+    "@angular/platform-browser": "~21.2.0",
+    "@aws-sdk/client-apigatewaymanagementapi": "^3",
+    "@aws-sdk/client-cognito-identity-provider": "^3",
+    "@aws-sdk/client-dynamodb": "^3",
+    "@aws-sdk/client-secrets-manager": "^3",
+    "@aws-sdk/client-sesv2": "^3",
+    "@aws-sdk/client-sqs": "^3",
+    "@aws-sdk/lib-dynamodb": "^3",
+    "@aws-sdk/util-dynamodb": "^3",
+    "aws-cdk-lib": "^2.260.0",
+    "aws-jwt-verify": "^5",
+    "constructs": "^10.4.0",
+    "ioredis": "^5.11.1",
+    "rxjs": "^7.8.0",
+    "tslib": "^2.8.0",
+    "web-push": "^3.6"
+  },
+  "devDependencies": {
+    "@angular/build": "~21.2.0",
+    "@angular/cli": "~21.2.0",
+    "@angular/compiler-cli": "~21.2.0",
+    "@types/aws-lambda": "^8",
+    "@types/node": "^24",
+    "@types/web-push": "^3",
+    "aws-cdk": "^2.1100.0",
+    "esbuild": "^0.27",
+    "tsx": "^4",
+    "typescript": "~5.9.3"
+  }
+}

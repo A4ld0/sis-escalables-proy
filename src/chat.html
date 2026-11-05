@@ -1,0 +1,146 @@
+<header><h1>Chat</h1>
+  @if (profile()) {
+    <span>{{ connected() ? 'En línea' : 'Reconectando…' }}</span>
+    <button type="button" (click)="logout()">Cerrar sesión</button>
+  }
+</header>
+@if (error()) { <p class="alert" role="alert">{{error()}}</p> }
+@if (notice()) { <p class="notice" role="status">{{notice()}}</p> }
+@if (!profile()) {
+  <main class="welcome">
+    <h2>Mensajes en tiempo real</h2>
+    @if (ready()) {
+      <button (click)="login()">Iniciar sesión</button>
+      <button (click)="login(true)">Crear cuenta</button>
+    }
+  </main>
+} @else {
+  <main class="layout">
+    <aside aria-label="Conversaciones y contactos">
+      <h2>Conversaciones</h2>
+      <nav aria-label="Bandeja">
+        @for (c of conversations(); track c.cid) {
+          <button [attr.aria-current]="selected()?.cid === c.cid ? 'true' : null" (click)="select(c)">
+            {{label(c)}} @if (c.unread) { <strong>{{c.unread}} sin leer</strong> }
+          </button>
+        }
+        @if (moreInbox()) { <button (click)="loadInbox()">Más conversaciones</button> }
+      </nav>
+      <form (ngSubmit)="newConversation()">
+        <label for="group">Nombre del grupo</label>
+        <div class="row"><input id="group" name="group" [(ngModel)]="groupName" maxlength="80" required><button>Crear grupo</button></div>
+      </form>
+      <h2>Contactos</h2>
+      <form (ngSubmit)="find()">
+        <label for="search">Correo o nombre de usuario</label>
+        <div class="row"><input id="search" name="search" [(ngModel)]="search" required><button>Buscar</button></div>
+      </form>
+      <ul>
+        @for (person of results(); track person.uid) {
+          <li>{{person.displayName}} <button (click)="invite(person)">Invitar</button> </li>
+        }
+      </ul>
+      <button (click)="loadContacts()">Actualizar contactos</button>
+      <ul>
+        @for (person of contacts(); track person.uid) {
+          <li>{{person.displayName}}
+            @switch (person.relationship) {
+              @case ('incoming') { <button (click)="invite(person)">Aceptar</button> }
+              @case ('accepted') { <button (click)="newConversation(person)">Abrir chat</button> }
+              @default { <small>Invitación pendiente</small> }
+            }
+          </li>
+        }
+      </ul>
+      <details>
+        <summary>Perfil y privacidad</summary>
+        <p>Usuario: {{profile()?.username}}</p>
+        <form (ngSubmit)="saveProfile()">
+          <label>Nombre visible <input name="displayName" [(ngModel)]="editName" maxlength="80" required></label>
+          <label>Estado <input name="status" [(ngModel)]="editStatus" maxlength="160"></label>
+          <label>Avatar (URL HTTPS) <input name="avatar" [(ngModel)]="editAvatar" type="url"></label>
+          <button>Guardar perfil</button>
+        </form>
+                @if (blocked().length) {
+          <h3>Usuarios bloqueados</h3>
+          <ul>
+            @for (person of blocked(); track person.uid) {
+              <li>{{person.displayName}} <button (click)="block(person,true)">Desbloquear</button></li>
+            }
+          </ul>
+        }
+        <div class="actions">
+          @if (push) { <button (click)="enablePush()">Activar notificaciones web</button> }
+          @if (digest) {
+            <button (click)="setDigest(true)">Activar resumen por correo</button>
+            <button (click)="setDigest(false)">Desactivar resumen por correo</button>
+          }
+          <button (click)="exportData()">Exportar datos</button>
+          <button class="danger" (click)="deleteAccount()">Borrar cuenta</button>
+        </div>
+      </details>
+    </aside>
+    <section class="conversation" aria-label="Chat seleccionado">
+      @if (selected(); as c) {
+        <h2>{{label(c)}}</h2>
+        <details>
+          <summary>Miembros y moderación</summary>
+          <ul>
+            @for (person of members(); track person.uid) {
+              <li>
+                @if (person.avatarUrl) { <img [src]="person.avatarUrl" width="24" height="24" alt="" referrerpolicy="no-referrer"> }
+                {{person.displayName}} · {{person.role}} · {{person.online ? 'En línea' : 'Sin conexión'}}
+                @if (!person.online && person.lastSeenAt) { <small>{{person.lastSeenAt | date:'short'}}</small> }
+                @if (person.status) { <small>{{person.status}}</small> }
+                @if (person.uid !== profile()?.uid) {
+                  <button (click)="block(person)">Bloquear</button>
+                  <button (click)="block(person,true)">Desbloquear</button>
+                  @if (c.type==='group' && c.role==='owner') { <button (click)="transfer(person)">Transferir propiedad</button> }
+                }
+              </li>
+            }
+          </ul>
+          @if (c.type==='group' && (c.role==='owner' || c.role==='admin')) {
+            @for (person of contacts(); track person.uid) {
+              @if (person.relationship === 'accepted') {
+                <p>{{person.displayName}} <button (click)="add(person,'member')">Añadir</button>
+                @if (c.role==='owner') { <button (click)="add(person,'admin')">Añadir como admin</button> }</p>
+              }
+            }
+          }
+          <form (ngSubmit)="report()">
+            <label for="reason">Motivo del reporte</label>
+            <div class="row"><input id="reason" name="reason" [(ngModel)]="reportReason" maxlength="1000" required><button>Reportar</button></div>
+          </form>
+          @if (c.type==='group') {
+            <button (click)="moderate(false)">Salir del grupo</button>
+            @if (c.role==='owner') { <button class="danger" (click)="moderate(true)">Eliminar grupo</button> }
+          }
+        </details>
+        @if (older()) { <button (click)="loadOlder()">Cargar anteriores</button> }
+        <ol class="messages" aria-label="Mensajes">
+          @for (m of messages(); track m.seq) {
+            <li [class.mine]="m.senderId === profile()?.uid">
+              @if (m.hidden) { <small>Mensaje oculto</small> }
+              @else {
+                <strong>{{sender(m)}}</strong> <small>{{m.createdAt | date:'short'}}</small>
+                <p>{{m.text}}</p>
+                @if (m.senderId===profile()?.uid) { <small>{{delivery(m)}}</small> }
+              }
+            </li>
+          }
+          @for (item of outbox(); track item.clientMessageId) {
+            @if (item.cid === c.cid) { <li class="mine"><p>{{item.text}}</p><small>Pendiente</small> <button (click)="discard(item)">Descartar</button></li> }
+          }
+        </ol>
+        <p class="typing" role="status">{{typing() ? 'Alguien está escribiendo…' : ''}}</p>
+        <form (ngSubmit)="send()">
+          <label for="message">Mensaje</label>
+          <div class="row"><textarea id="message" name="message" [(ngModel)]="text" (input)="typingEvent()" maxlength="4000" rows="2" required></textarea><button>Enviar</button></div>
+        </form>
+      } @else { <p>Selecciona una conversación o crea un grupo.</p> }
+    </section>
+  </main>
+}
+
+

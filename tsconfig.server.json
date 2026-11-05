@@ -1,0 +1,1 @@
+{"extends":"./tsconfig.json","compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","types":["node","aws-lambda"]},"files":[],"include":["infra/**/*.ts","server/**/*.ts"]}

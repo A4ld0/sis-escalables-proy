@@ -1,0 +1,28 @@
+:root { color-scheme: light; font: 16px/1.5 system-ui, sans-serif; color: #182842; background: #f3f6fa; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+header { display: flex; align-items: center; gap: 1rem; padding: .8rem clamp(1rem, 5vw, 4rem); color: white; background: #152b50; }
+header h1 { margin: 0 auto 0 0; }
+h2 { font-size: 1.25rem; margin-block: .5rem; }
+.layout { display: grid; grid-template-columns: minmax(17rem, 24rem) minmax(0, 1fr); gap: 1rem; max-width: 86rem; padding: 1rem; margin: auto; }
+aside, .conversation, .welcome { background: white; border: 1px solid #cdd7e7; border-radius: .75rem; padding: 1rem; min-width: 0; }
+.welcome { margin: 2rem auto; max-width: 34rem; }
+nav, .actions { display: flex; flex-direction: column; align-items: start; gap: .4rem; }
+form, details { margin-block: .75rem; }
+label { display: block; margin-top: .35rem; }
+.row { display: flex; gap: .4rem; align-items: start; }
+input, textarea { font: inherit; min-width: 0; width: 100%; padding: .5rem; border: 1px solid #667693; border-radius: .35rem; }
+button { font: inherit; cursor: pointer; border: 1px solid #5f759a; border-radius: .35rem; padding: .38rem .6rem; color: #152b50; background: #eef4ff; }
+button:hover, [aria-current=true] { background: #d9e7ff; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 3px solid #2164bb; outline-offset: 2px; }
+summary { cursor: pointer; font-weight: 600; }
+li { margin-block: .3rem; }
+.messages { display: flex; flex-direction: column; gap: .45rem; list-style: none; padding: .3rem; max-height: 55vh; overflow: auto; }
+.messages li { align-self: start; max-width: 90%; background: #f1f4f8; border-radius: .5rem; padding: .5rem .7rem; overflow-wrap: anywhere; }
+.messages .mine { align-self: end; background: #e1ecff; }
+.messages p { white-space: pre-wrap; margin: .2rem 0; }
+.typing { min-height: 1.5rem; }
+.alert, .notice { margin: .5rem 1rem; padding: .55rem; border-radius: .35rem; background: #ffedec; color: #791b18; }
+.notice { background: #e7f7ee; color: #144e34; }
+.danger { color: #851d22; }
+@media(max-width: 48rem) { .layout { grid-template-columns: minmax(0, 1fr); } }
