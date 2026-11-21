@@ -1,0 +1,78 @@
+name: Deploy Chat-dev to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aws-chat-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      AWS_PAGER: ''
+      CHAT_STACK: Chat-dev
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install, test and build
+        run: |
+          npm ci --no-audit --no-fund
+          npm run check
+          npm test
+          npm run build
+
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: chat-dev-${{ github.run_id }}
+          role-duration-seconds: 1800
+          mask-aws-account-id: true
+
+      - name: Deploy and verify the site setting
+        shell: bash
+        run: |
+          site_paused() {
+            aws cloudformation describe-stacks --stack-name "$CHAT_STACK" \
+              --query "Stacks[0].Parameters[?ParameterKey=='SitePaused'].ParameterValue | [0]" \
+              --output text
+          }
+
+          before="$(site_paused)"
+          case "$before" in
+            true|false) ;;
+            *) echo 'SitePaused is missing from the existing stack.' >&2; exit 1 ;;
+          esac
+
+          npx --no-install cdk deploy "$CHAT_STACK" -c stage=dev \
+            --previous-parameters true --require-approval never --progress events
+
+          after="$(site_paused)"
+          if [[ "$before" != "$after" ]]; then
+            echo 'SitePaused changed during deployment.' >&2
+            exit 1
+          fi
+          echo "SitePaused=$after"
