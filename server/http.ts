@@ -33,6 +33,14 @@ async function profile(uid: string, claims: Record<string, unknown>) {
 }
 const active = (uid: string) => check(user(uid), 'PROFILE', 'attribute_exists(pk) AND attribute_not_exists(deleting)');
 const publicProfile = (item: Record<string, any>) => ({ uid:item.uid, username:item.username, displayName:item.displayName, status:item.profileStatus ?? item.status, avatarUrl:item.avatarUrl, lastSeenAt:item.lastSeenAt });
+const historyVersion = (viewer: Record<string, any>, meta: Record<string, any>, member: Record<string, any>) =>
+  createHash('sha256').update(JSON.stringify([
+    viewer.historyPrivacyVersion, meta.historyContentVersion, member.joinedAt,
+  ])).digest('base64url');
+const conversationSummary = (viewer: Record<string, any>, meta: Record<string, any>, member: Record<string, any>) => ({
+  cid:meta.cid,name:meta.name,type:meta.type,role:member.memberRole,lastReadSeq:member.lastReadSeq,
+  unread:Math.max(0,meta.lastSeq-member.lastReadSeq),cacheVersion:historyVersion(viewer,meta,member),
+});
 const memberItems = (cid: string, uid: string, role: string, seq: number, lastActivity: string) => [
   insert({pk:conv(cid), sk:memberKey(uid), uid, memberRole:role, lastReadSeq:seq, joinedAt:now()}, 'attribute_not_exists(pk)'),
   insert({pk:user(uid), sk:conv(cid), cid, inboxPk:user(uid), inboxSk:lastActivity+'#'+cid}),
@@ -120,9 +128,16 @@ async function routes(uid: string, me: Record<string, any>, method: string, path
     }
     return blocked;
   }
-  if (resource === 'blocks' && id && uid !== id) {
-    if (method === 'POST') { await put({pk:my,sk:'BLOCK#'+id}); return {}; }
-    if (method === 'DELETE') { await del(my,'BLOCK#'+id); return {}; }
+  if (resource === 'blocks' && id && uid !== id && (method === 'POST' || method === 'DELETE')) {
+    const peer = user(id);
+    const other = await get(peer,'PROFILE');
+    const version = {':version':randomUUID()};
+    await transaction([
+      method === 'POST' ? insert({pk:my,sk:'BLOCK#'+id}) : remove(my,'BLOCK#'+id),
+      change(my,'PROFILE','SET historyPrivacyVersion = :version',version,'attribute_exists(pk) AND attribute_not_exists(deleting)'),
+      ...(other ? [change(peer,'PROFILE','SET historyPrivacyVersion = :version',version,'attribute_exists(pk)')] : []),
+    ]);
+    return {};
   }
   if (resource === 'reports' && method === 'POST') {
     const cid = field(input.cid,80);
@@ -172,8 +187,7 @@ async function routes(uid: string, me: Record<string, any>, method: string, path
     const items = await Promise.all((page.Items ?? []).map(async link => {
       const [meta, member] = await Promise.all([get(link.sk,'META'),get(link.sk,memberKey(uid))]);
       if (!meta || !member || meta.deleted) return undefined;
-      return {cid:meta.cid,name:meta.name,type:meta.type,role:member.memberRole,lastReadSeq:member.lastReadSeq,
-        unread:Math.max(0,meta.lastSeq-member.lastReadSeq)};
+      return conversationSummary(me,meta,member);
     }));
     return {items:items.filter(Boolean),cursor:inboxCursor(page.LastEvaluatedKey)};
   }
@@ -207,11 +221,15 @@ async function routes(uid: string, me: Record<string, any>, method: string, path
   const meta = await get(pk,'META');
   requireThat(meta && !meta.deleted,404,'Conversación eliminada');
   const role = member.memberRole;
+  if (!section && method === 'GET') return conversationSummary(me,meta,member);
   if (section === 'messages' && method === 'GET') {
     const limit = Math.min(integer(params.limit ?? '50',1),100);
-    const after = params.afterSeq === undefined ? undefined : integer(params.afterSeq);
+    const requestedAfter = params.afterSeq === undefined ? undefined : integer(params.afterSeq);
     const before = params.beforeSeq === undefined ? undefined : integer(params.beforeSeq,1);
-    requireThat(after === undefined || before === undefined,400,'Usa un solo cursor');
+    requireThat(requestedAfter === undefined || before === undefined,400,'Usa un solo cursor');
+    const cacheVersion = historyVersion(me,meta,member);
+    const reset = requestedAfter !== undefined && params.cacheVersion !== undefined && params.cacheVersion !== cacheVersion;
+    const after = reset ? undefined : requestedAfter;
     const result = await query(pk,'MSG#',{limit,after,before,reverse:after===undefined});
     const blocked = new Set<string>();
     for await (const item of all(my,'BLOCK#')) blocked.add(item.sk.slice(6));
@@ -219,7 +237,7 @@ async function routes(uid: string, me: Record<string, any>, method: string, path
     await Promise.all(senders.map(async sender => {
       if (await get(user(sender),'BLOCK#'+uid)) blocked.add(sender);
     }));
-    return {items:(result.Items ?? []).map(item => !item.senderId?{seq:item.seq,text:'[Mensaje eliminado]',createdAt:item.createdAt}:blocked.has(item.senderId)?{seq:item.seq,hidden:true}:{...item,text:item.messageBody}),cursor:result.LastEvaluatedKey?.sk};
+    return {items:(result.Items ?? []).map(item => !item.senderId?{seq:item.seq,text:'[Mensaje eliminado]',createdAt:item.createdAt}:blocked.has(item.senderId)?{seq:item.seq,hidden:true}:{...item,text:item.messageBody}),cursor:result.LastEvaluatedKey?.sk,cacheVersion,reset};
   }
   if (section === 'messages' && method === 'POST') return saveMessage(uid,id,input);
   if ((section === 'read' || section === 'delivered') && method === 'POST') {
@@ -276,6 +294,7 @@ async function routes(uid: string, me: Record<string, any>, method: string, path
 }
 
 export async function handler(event: APIGatewayProxyEventV2WithJWTAuthorizer) {
+  if (event.requestContext.http.method === 'OPTIONS') return {statusCode:204,body:''};
   try {
     const claims = event.requestContext.authorizer.jwt.claims;
     requireThat(claims.token_use === 'id',401,'Sesión inválida');
@@ -299,8 +318,12 @@ export async function purge(uid: string, cognitoUsername: string) {
   if (me) await update(my,'PROFILE','SET deleting = :yes',{':yes':true},'attribute_exists(pk)');
   await put({pk:my,sk:'DELETED'});
   for await (const item of all(my,'AUTHORED#')) {
-    const msg = await get(conv(item.cid),messageKey(item.seq));
-    if (msg?.senderId === uid) await update(conv(item.cid),msg.sk,'SET messageBody = :text REMOVE senderId, clientMessageId',{':text':'[Mensaje eliminado]'},'attribute_exists(pk)');
+    const pk = conv(item.cid);
+    const msg = await get(pk,messageKey(item.seq));
+    if (msg?.senderId === uid) await transaction([
+      change(pk,msg.sk,'SET messageBody = :text REMOVE senderId, clientMessageId',{':text':'[Mensaje eliminado]'},'attribute_exists(pk)'),
+      change(pk,'META','SET historyContentVersion = :version',{':version':randomUUID()},'attribute_exists(pk)'),
+    ]);
     await del(conv(item.cid),item.dedup);
     await del(my,item.sk);
   }

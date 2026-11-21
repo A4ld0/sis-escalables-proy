@@ -28,6 +28,13 @@ const stage = String(app.node.tryGetContext('stage') ?? 'dev');
 if (!/^[a-z][a-z0-9-]{1,18}$/.test(stage)) throw new Error('stage inválido');
 const stack = new cdk.Stack(app,'Chat-'+stage,{env:{account:process.env.CDK_DEFAULT_ACCOUNT,region:'us-east-1'}});
 const config = (key: string) => String(app.node.tryGetContext(key) ?? '');
+const sitePaused = new cdk.CfnParameter(stack,'SitePaused',{
+  type:'String',allowedValues:['true','false'],default:'false',
+  description:'Disable the CloudFront site and remove its AWS WAF web ACL while paused.',
+});
+const siteActive = new cdk.CfnCondition(stack,'SiteActive',{
+  expression:cdk.Fn.conditionEquals(sitePaused.valueAsString,'false'),
+});
 const bucket = new s3.Bucket(stack,'Site',{blockPublicAccess:s3.BlockPublicAccess.BLOCK_ALL,enforceSSL:true,versioned:true});
 const acl = new waf.CfnWebACL(stack,'EdgeFirewall',{
   scope:'CLOUDFRONT',defaultAction:{allow:{}},
@@ -37,10 +44,14 @@ const acl = new waf.CfnWebACL(stack,'EdgeFirewall',{
     {name:'Rate',priority:1,action:{block:{}},statement:{rateBasedStatement:{limit:3000,aggregateKeyType:'IP'}},visibilityConfig:{cloudWatchMetricsEnabled:true,metricName:'Rate',sampledRequestsEnabled:true}},
   ],
 });
+acl.cfnOptions.condition = siteActive;
 const edge = new cf.Distribution(stack,'Edge',{
-  defaultRootObject:'index.html',webAclId:acl.attrArn,httpVersion:cf.HttpVersion.HTTP2_AND_3,
+  defaultRootObject:'index.html',httpVersion:cf.HttpVersion.HTTP2_AND_3,
   defaultBehavior:{origin:origins.S3BucketOrigin.withOriginAccessControl(bucket),viewerProtocolPolicy:cf.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,cachePolicy:cf.CachePolicy.CACHING_DISABLED,responseHeadersPolicy:cf.ResponseHeadersPolicy.SECURITY_HEADERS},
 });
+const edgeResource = edge.node.defaultChild as cf.CfnDistribution;
+edgeResource.addPropertyOverride('DistributionConfig.Enabled',cdk.Fn.conditionIf(siteActive.logicalId,true,false));
+edgeResource.addPropertyOverride('DistributionConfig.WebACLId',cdk.Fn.conditionIf(siteActive.logicalId,acl.attrArn,cdk.Aws.NO_VALUE));
 const site = 'https://'+edge.domainName;
 const pool = new cognito.UserPool(stack,'Users',{
   selfSignUpEnabled:true,signInAliases:{email:true},autoVerify:{email:true},
@@ -139,10 +150,15 @@ if (digestFrom) {
   digest.addToRolePolicy(new iam.PolicyStatement({actions:['ses:SendEmail'],resources:[stack.formatArn({service:'ses',resource:'identity',resourceName:digestFrom,arnFormat:cdk.ArnFormat.SLASH_RESOURCE_NAME})]}));
   new events.Rule(stack,'DailyDigest',{schedule:events.Schedule.rate(cdk.Duration.days(1)),targets:[new targets.LambdaFunction(digest)]});
 }
+const httpIntegration = new integrations.HttpLambdaIntegration('Routes',httpHandler);
 const http = new apigw.HttpApi(stack,'Http',{
-  defaultIntegration:new integrations.HttpLambdaIntegration('Routes',httpHandler),
+  defaultIntegration:httpIntegration,
   defaultAuthorizer:new auth.HttpJwtAuthorizer('CognitoJwt',pool.userPoolProviderUrl,{jwtAudience:[client.userPoolClientId]}),
   corsPreflight:{allowOrigins:[site],allowHeaders:['Authorization','Content-Type'],allowMethods:[apigw.CorsHttpMethod.ANY],maxAge:cdk.Duration.hours(1)},
+});
+http.addRoutes({
+  path:'/v1/{proxy+}',methods:[apigw.HttpMethod.OPTIONS],integration:httpIntegration,
+  authorizer:new apigw.HttpNoneAuthorizer(),
 });
 const ws = new apigw.WebSocketApi(stack,'Socket',{
   routeSelectionExpression:'$request.body.action',

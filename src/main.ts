@@ -2,11 +2,13 @@ import { Component, OnDestroy, OnInit, signal } from '@angular/core';
 import { bootstrapApplication } from '@angular/platform-browser';
 import { FormsModule } from '@angular/forms';
 import { DatePipe } from '@angular/common';
-import { Config, decode, Pending, queue, Session } from './session';
+import { ApiError, Config, decode, Pending, queue, Session } from './session';
+import { clearHistory, Message, readHistory, recentMessageLimit, SavedHistory, writeHistory } from './history';
 
 interface Person { uid: string; username: string; displayName: string; status: string; avatarUrl: string; lastSeenAt?: string; online?: boolean; role?: string; relationship?: string; lastReadSeq?: number; lastDeliveredSeq?: number; }
-interface Conversation { cid: string; name: string; type: 'direct'|'group'; role: string; unread: number; }
-interface Message { seq: number; senderId?: string; text?: string; createdAt?: string; hidden?: boolean; }
+interface Conversation { cid: string; name: string; type: 'direct'|'group'; role: string; unread: number; cacheVersion?: string; }
+interface HistoryPage { items: Message[]; cursor?: string; cacheVersion?: string; reset?: boolean; }
+interface OpenHistory { cid: string; syncing: boolean; lastSeq?: number; version?: string; cached?: SavedHistory; savedVersion?: string; pendingSeq?: number; }
 
 @Component({
   selector:'chat-root', imports:[FormsModule,DatePipe], templateUrl:'./chat.html',
@@ -44,9 +46,7 @@ class Chat implements OnInit, OnDestroy {
   private attempts = 0;
   private expires?: ReturnType<typeof setTimeout>;
   private flushing = false;
-  private syncing = false;
-  private generation = 0;
-  private last = 0;
+  private history?: OpenHistory;
   private cursor?: string;
   private inboxPaged = false;
   private destroyed = false;
@@ -66,21 +66,30 @@ class Chat implements OnInit, OnDestroy {
       this.editName = me.displayName;
       this.editStatus = me.status;
       this.editAvatar = me.avatarUrl;
-      await Promise.all([this.inbox(),this.refreshContacts(),this.refreshQueue(),this.refreshBlocks()]);
+      await Promise.all([this.inbox(),this.refreshContacts(),this.refreshQueue().catch(() => {}),this.refreshBlocks()]);
       const cid = new URLSearchParams(location.search).get('chat');
       if (cid) {
-        const found = this.conversations().find(c => c.cid === cid);
-        if (found) await this.select(found);
+        await this.run(async () => {
+          try {
+            const conversation = this.conversations().find(c => c.cid === cid)
+              ?? await this.session!.api<Conversation>('/conversations/'+encodeURIComponent(cid));
+            await this.select(conversation);
+          } catch (error) {
+            if (error instanceof ApiError && [401,403,404].includes(error.status)) {
+              this.rememberConversation();
+              await clearHistory(me.uid,cid);
+            }
+            throw error;
+          }
+        });
       }
       void this.connect();
-      this.timer = setInterval(() => void (async () => {
-        await this.flush();
-        await Promise.all([this.sync(),this.inbox()]);
-      })().catch(() => {}),8000);
+      this.timer = setInterval(() => void Promise.allSettled([this.flush(),this.sync(),this.inbox()]),8000);
     });
   }
   ngOnDestroy() {
     this.destroyed = true;
+    this.history = undefined;
     this.ws?.close();
     clearTimeout(this.retry);
     clearTimeout(this.expires);
@@ -94,11 +103,19 @@ class Chat implements OnInit, OnDestroy {
     catch (error) { this.error.set((error as Error).message); }
   }
   login(signup = false) { return this.run(() => this.session!.login(signup)); }
-  logout() { this.session!.logout(); }
+  async logout() {
+    const uid = this.profile()?.uid;
+    this.ngOnDestroy();
+    this.profile.set(null);
+    this.messages.set([]);
+    if (uid) await clearHistory(uid);
+    this.session!.logout();
+  }
   private async connect() {
     if (this.destroyed) return;
     try {
       const {ticket,expires} = await this.session!.api<{ticket:string;expires:number}>('/socket','POST');
+      if (this.destroyed) return;
       const ws = new WebSocket(this.session!.config.ws+'?'+new URLSearchParams({ticket}));
       this.ws = ws;
       this.expires = setTimeout(() => ws.close(),Math.max(1000,expires*1000-Date.now()-15000));
@@ -110,10 +127,11 @@ class Chat implements OnInit, OnDestroy {
           this.heartbeat = setInterval(heartbeat,25000);
         }
         this.attempts = 0;
-        void this.run(async () => { await this.flush(); await this.sync(); });
+        void this.run(() => Promise.all([this.flush(),this.sync()]));
       };
       ws.onclose = () => { clearInterval(this.heartbeat); this.connected.set(false); this.scheduleReconnect(); };
       ws.onmessage = event => {
+        if (this.destroyed) return;
         const data = JSON.parse(event.data);
         if (data.kind === 'typing' && data.cid === this.selected()?.cid) {
           this.typing.set(true);
@@ -126,12 +144,16 @@ class Chat implements OnInit, OnDestroy {
         if (data.kind === 'message' && data.cid !== this.selected()?.cid) {
           void this.session!.api('/conversations/'+data.cid+'/delivered','POST',{seq:data.seq}).catch(() => {});
         }
-        if (data.kind === 'message' && data.cid === this.selected()?.cid) {
-          if (data.seq === this.last+1 && !this.syncing) {
-            this.last = data.seq;
+        const history = this.history;
+        if (data.kind === 'message' && history && data.cid === history.cid) {
+          if (history.syncing) {
+            history.pendingSeq = Math.max(history.pendingSeq ?? 0,data.seq);
+          } else if (history.lastSeq !== undefined && data.seq === history.lastSeq+1) {
+            history.lastSeq = data.seq;
             this.merge([data]);
+            void this.persistHistory(history);
             void this.run(() => this.receipts(data.cid,data.seq));
-          } else if (data.seq > this.last) void this.run(() => this.sync());
+          } else if (data.seq > (history.lastSeq ?? 0)) void this.run(() => this.sync());
         }
       };
     } catch { this.scheduleReconnect(); }
@@ -177,34 +199,49 @@ class Chat implements OnInit, OnDestroy {
   }
   select(c: Conversation) {
     return this.run(async () => {
-      const generation = ++this.generation;
+      const history: OpenHistory = {cid:c.cid,syncing:true};
+      this.history = history;
       this.selected.set(c);
+      this.rememberConversation(c.cid);
       this.messages.set([]);
       this.members.set([]);
       this.older.set(false);
       this.typing.set(false);
-      this.last = 0;
-      const [page,members] = await Promise.all([
-        this.session!.api<{items:Message[];cursor?:string}>('/conversations/'+c.cid+'/messages'),
-        this.session!.api<Person[]>('/conversations/'+c.cid+'/members'),
-      ]);
-      if (generation !== this.generation) return;
-      this.merge(page.items);
-      this.last = Math.max(this.last,...page.items.map(m=>m.seq),0);
-      this.members.set(members);
-      this.older.set(Boolean(page.cursor));
-      await this.receipts(c.cid,this.last);
+      const uid = this.profile()?.uid;
+      if (uid) history.cached = await readHistory(uid,c.cid);
+      if (this.history !== history) return;
+      history.savedVersion = history.cached?.version;
+      if (history.cached && this.selected()?.cacheVersion === history.cached.version) {
+        this.restoreHistory(history,history.cached);
+      }
+      history.syncing = false;
+      await this.sync();
     });
+  }
+  private rememberConversation(cid?: string) {
+    const url = new URL(location.href);
+    if (cid) url.searchParams.set('chat',cid);
+    else url.searchParams.delete('chat');
+    if (url.href !== location.href) window.history.replaceState(window.history.state,'',url);
+  }
+  private restoreHistory(history: OpenHistory, cached: SavedHistory) {
+    this.messages.set(cached.messages);
+    this.older.set(cached.older);
+    history.lastSeq = cached.lastSeq;
+    history.version = cached.version;
+    history.cached = undefined;
   }
   loadOlder() {
     return this.run(async () => {
-      const c = this.selected();
+      const history = this.history;
       const seq = this.messages()[0]?.seq;
-      if (!c || !seq) return;
-      const page = await this.session!.api<{items:Message[];cursor?:string}>('/conversations/'+c.cid+'/messages?beforeSeq='+seq);
-      if (this.selected()?.cid !== c.cid) return;
+      if (!history || !seq) return;
+      const page = await this.session!.api<HistoryPage>('/conversations/'+history.cid+'/messages?beforeSeq='+seq);
+      if (this.history !== history || this.messages()[0]?.seq !== seq) return;
+      if (page.cacheVersion !== history.version) { await this.sync(); return; }
       this.merge(page.items);
       this.older.set(Boolean(page.cursor));
+      await this.persistHistory(history);
     });
   }
   private merge(incoming: Message[]) {
@@ -216,23 +253,74 @@ class Chat implements OnInit, OnDestroy {
     if (document.visibilityState === 'visible') await this.session!.api('/conversations/'+cid+'/read','POST',{seq});
   }
   private async sync() {
-    const c = this.selected();
-    if (!c || this.syncing) return;
-    const generation = this.generation;
-    this.syncing = true;
+    const history = this.history;
+    if (!history || history.syncing) return;
+    history.syncing = true;
+    history.pendingSeq = undefined;
     try {
-      let page;
+      const path = '/conversations/'+history.cid;
+      const cached = history.cached;
+      let after = history.lastSeq ?? cached?.lastSeq;
+      let version = history.version ?? cached?.version;
+      let page: HistoryPage;
       do {
-        page = await this.session!.api<{items:Message[];cursor?:string}>('/conversations/'+c.cid+'/messages?afterSeq='+this.last);
-        if (generation !== this.generation) return;
+        const params = new URLSearchParams();
+        if (after !== undefined) params.set('afterSeq',String(after));
+        if (version) params.set('cacheVersion',version);
+        page = await this.session!.api<HistoryPage>(path+'/messages'+(params.size ? '?'+params : ''));
+        if (this.history !== history) return;
+        if (version && version !== page.cacheVersion && !page.reset) {
+          // A server without cache validation must supply a fresh history window.
+          page = await this.session!.api<HistoryPage>(path+'/messages');
+          if (this.history !== history) return;
+          after = undefined;
+        }
+        const latestPage = after === undefined || page.reset;
+        if (latestPage) {
+          this.messages.set([]);
+          this.older.set(Boolean(page.cursor));
+          after = 0;
+        } else if (history.cached) {
+          this.restoreHistory(history,history.cached);
+        }
+        history.cached = undefined;
         this.merge(page.items);
-        this.last = Math.max(this.last,...page.items.map(m=>m.seq));
+        after = Math.max(after ?? 0,...page.items.map(m=>m.seq));
+        history.lastSeq = after;
+        version = history.version = page.cacheVersion;
+        if (latestPage || page.items.length) await this.persistHistory(history);
+        if (this.history !== history) return;
+        if (latestPage) break;
       } while (page.cursor && page.items.length);
-      const members = await this.session!.api<Person[]>('/conversations/'+c.cid+'/members');
-      if (generation !== this.generation) return;
+      const members = await this.session!.api<Person[]>(path+'/members');
+      if (this.history !== history) return;
       this.members.set(members);
-      await this.receipts(c.cid,this.last);
-    } finally { this.syncing = false; }
+      await this.receipts(history.cid,after ?? 0);
+    } catch (error) {
+      if (this.history !== history) return;
+      if (error instanceof ApiError && [401,403,404].includes(error.status)) {
+        this.history = undefined;
+        this.selected.set(null);
+        this.messages.set([]);
+        this.rememberConversation();
+        const uid = this.profile()?.uid;
+        if (uid) await clearHistory(uid,history.cid);
+      }
+      throw error;
+    } finally { history.syncing = false; }
+    if (this.history === history && (history.pendingSeq ?? 0) > (history.lastSeq ?? 0)) await this.sync();
+  }
+  private async persistHistory(history: OpenHistory) {
+    const uid = this.profile()?.uid;
+    if (this.history !== history || !uid || !history.version || history.lastSeq === undefined) return;
+    const messages = this.messages();
+    const recent = messages.slice(-recentMessageLimit).map(({seq,senderId,text,createdAt,hidden}) => (
+      {seq,senderId,text,createdAt,hidden}
+    ));
+    const saved = await writeHistory(uid,history.cid,{
+      messages:recent,lastSeq:history.lastSeq,older:this.older() || messages.length > recent.length,version:history.version,
+    },history.savedVersion);
+    if (saved) history.savedVersion = saved;
   }
   private refreshQueue() {
     return queue('readonly',store=>store.getAll()).then(items => this.outbox.set((items as Pending[]).filter(x=>x.uid===this.profile()?.uid)));
@@ -302,7 +390,14 @@ class Chat implements OnInit, OnDestroy {
       const c = this.selected()!;
       if (!confirm(remove?'¿Eliminar el grupo?':'¿Salir de la conversación?')) return;
       await this.session!.api('/conversations/'+c.cid+(remove?'':'/members/me'),'DELETE');
-      this.selected.set(null);
+      if (this.history?.cid === c.cid) {
+        this.history = undefined;
+        this.selected.set(null);
+        this.messages.set([]);
+        this.rememberConversation();
+      }
+      const uid = this.profile()?.uid;
+      if (uid) await clearHistory(uid,c.cid);
       this.conversations.set([]);
       this.inboxPaged = false;
       await this.inbox();
@@ -311,10 +406,13 @@ class Chat implements OnInit, OnDestroy {
   block(person: Person, unblock = false) {
     return this.run(async () => {
       await this.session!.api('/blocks/'+person.uid,unblock?'DELETE':'POST');
-      await Promise.all([this.refreshBlocks(),this.refreshContacts()]);
-      this.notice.set(unblock?'Usuario desbloqueado.':'Usuario bloqueado.');
+      this.conversations.update(items => items.map(item => ({...item,cacheVersion:undefined})));
       const c = this.selected();
-      if (c) await this.select(c);
+      await Promise.all([
+        c ? this.select({...c,cacheVersion:undefined}) : undefined,
+        this.refreshBlocks(),this.refreshContacts(),this.inbox(),
+      ]);
+      this.notice.set(unblock?'Usuario desbloqueado.':'Usuario bloqueado.');
     });
   }
   report() {
@@ -358,8 +456,9 @@ class Chat implements OnInit, OnDestroy {
     return this.run(async () => {
       if (!confirm('¿Solicitar el borrado de tu cuenta?')) return;
       await this.session!.api('/account','DELETE');
-      for (const item of this.outbox()) await queue('readwrite',store=>store.delete(item.clientMessageId));
-      this.logout();
+      try {
+        for (const item of this.outbox()) await queue('readwrite',store=>store.delete(item.clientMessageId));
+      } finally { await this.logout(); }
     });
   }
 }

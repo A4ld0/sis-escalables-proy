@@ -31,6 +31,14 @@ npx cdk deploy -c stage=dev --profile mi-perfil
 
 Abre el valor `SiteUrl` de la salida. El sitio obtiene sus URL de API y los parámetros públicos de Cognito de `/config.json`. Conserva el mismo `stage` al actualizar. Si necesitas un prefijo de Cognito distinto, pásalo con `-c domainPrefix=prefijo-unico` desde el primer despliegue. Los recursos retenidos y la protección contra borrado requieren una decisión explícita antes de retirar un entorno.
 
+### Pausar el sitio
+
+`SitePaused=true` desactiva la distribución de CloudFront y retira su ACL de WAF. CloudFormation conserva el valor en despliegues posteriores. Para volver a habilitar el sitio y restaurar su WAF, usa el mismo perfil y entorno del despliegue original.
+
+```powershell
+npx cdk deploy Chat-dev -c stage=dev --parameters Chat-dev:SitePaused=false --profile mi-perfil
+```
+
 ### Inicio de sesión federado
 
 Configura las aplicaciones en cada proveedor y registra la URL `FederationCallback` de la salida para OAuth. Para el proveedor SAML, registra la salida `SamlAcs` y usa `urn:amazon:cognito:sp:USER_POOL_ID` como identificador del proveedor de servicio. Crea los siguientes secretos JSON en Secrets Manager y pásale al CDK **sus nombres**.

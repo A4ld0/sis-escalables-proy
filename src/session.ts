@@ -2,6 +2,9 @@ export interface Config {
   http: string; ws: string; login: string; clientId: string; redirect: string; vapidPublicKey: string; digest: boolean; presence: boolean;
 }
 interface Tokens { id_token: string; access_token: string; refresh_token?: string; }
+export class ApiError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 export function decode(value: string) {
   return Uint8Array.from(atob(value.replace(/-/g,'+').replace(/_/g,'/').padEnd(Math.ceil(value.length/4)*4,'=')), c => c.charCodeAt(0));
@@ -55,7 +58,7 @@ export class Session {
     const result = await fetch(this.config.http+'/v1'+path,{method,headers:{Authorization:'Bearer '+await this.token(),
       ...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)});
     const data = await result.json();
-    if (!result.ok) throw new Error(data.error ?? 'No se pudo completar la solicitud.');
+    if (!result.ok) throw new ApiError(result.status,data.error ?? 'No se pudo completar la solicitud.');
     return data;
   }
 }

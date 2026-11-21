@@ -6,7 +6,7 @@
     "check": "tsc -p tsconfig.server.json --noEmit",
     "synth": "cdk synth",
     "start": "ng serve",
-    "test": "tsx --test server/data.test.ts"
+    "test": "tsx --test server/data.test.ts server/history.test.ts"
   },
   "dependencies": {
     "@angular/common": "~21.2.0",
